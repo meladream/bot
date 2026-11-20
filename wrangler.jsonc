@@ -1,0 +1,25 @@
+{
+  // Имя должно совпадать с названием проекта в Cloudflare (шаг 3 в README)
+  "name": "shop-bot",
+  "main": "index.js",
+  "compatibility_date": "2025-06-01",
+  "observability": { "enabled": true },
+
+  // Шаг 1 в README: создайте базу D1 и вставьте её Database ID сюда
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "shop-bot-db",
+      "database_id": "ВСТАВЬТЕ-ID-БАЗЫ"
+    }
+  ],
+
+  // Обычные настройки. Менять можно прямо на GitHub: Cloudflare сам обновит бота.
+  // BOT_TOKEN и WEBHOOK_SECRET сюда НЕ пишите: они задаются секретами в Cloudflare.
+  "vars": {
+    "SHOP_NAME": "Мой магазин",
+    "CURRENCY": "₽",
+    "MANAGER_USERNAME": "",
+    "ADMIN_IDS": ""
+  }
+}
