@@ -2,7 +2,8 @@
  * Telegram-бот магазина на Cloudflare Workers + D1 (без серверов и таблиц).
  *
  * Telegram присылает сообщения на /webhook, бот отвечает через Bot API.
- * Товары лежат в базе D1 (binding DB), админ управляет ими кнопками в Telegram.
+ * Каталог, корзина и брони лежат в базе D1 (binding DB).
+ * Админ управляет товарами и бронями кнопками прямо в Telegram.
  *
  * Секреты (Cloudflare → Settings → Variables and Secrets): BOT_TOKEN, WEBHOOK_SECRET.
  * Обычные настройки (SHOP_NAME, CURRENCY, MANAGER_USERNAME, ADMIN_IDS) — в wrangler.jsonc.
@@ -15,6 +16,7 @@ const PAGE_SIZE = 8;
 const esc = (s) =>
   String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const fmtPrice = (p) => (Number.isInteger(p) ? String(p) : Number(p).toFixed(2));
+const short = (s, n = 18) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
 function parseNum(s) {
   const t = String(s ?? "").trim();
@@ -26,8 +28,9 @@ function parseNum(s) {
 const cur = (env) => env.CURRENCY || "₽";
 const shopName = (env) => env.SHOP_NAME || "Наш магазин";
 const manager = (env) => String(env.MANAGER_USERNAME || "").replace(/^@/, "");
-const isAdmin = (env, uid) =>
-  String(env.ADMIN_IDS || "").split(",").map((s) => s.trim()).filter(Boolean).includes(String(uid));
+const adminIds = (env) =>
+  String(env.ADMIN_IDS || "").split(",").map((s) => s.trim()).filter(Boolean).map(Number);
+const isAdmin = (env, uid) => adminIds(env).includes(Number(uid));
 
 const btn = (text, data) => ({ text, callback_data: data });
 const urlBtn = (text, url) => ({ text, url });
@@ -74,9 +77,16 @@ async function show(env, msg, text, markup) {
 const ack = (env, cb, text) =>
   tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text });
 
+/** Всплывающее окно с «ОК». Возвращает true: «ответ на кнопку уже дан». */
 async function warn(env, cb, text) {
   await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text, show_alert: true });
-  return true; // «ответ уже дан»
+  return true;
+}
+
+/** Короткая подсказка внизу экрана. */
+async function toast(env, cb, text) {
+  await tg(env, "answerCallbackQuery", { callback_query_id: cb.id, text });
+  return true;
 }
 
 // ------------------------------------------------------------------ база данных
@@ -84,16 +94,22 @@ async function warn(env, cb, text) {
 let dbReady = false;
 async function initDb(env) {
   if (dbReady) return;
+  const q = (sql) => env.DB.prepare(sql);
   await env.DB.batch([
-    env.DB.prepare(
-      "CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)"),
-    env.DB.prepare(
-      "CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER NOT NULL, " +
+    q("CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)"),
+    q("CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER NOT NULL, " +
       "name TEXT NOT NULL, price REAL NOT NULL DEFAULT 0, stock INTEGER NOT NULL DEFAULT 0, " +
       "description TEXT NOT NULL DEFAULT '', photo TEXT NOT NULL DEFAULT '')"),
-    env.DB.prepare("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY)"),
-    env.DB.prepare(
-      "CREATE TABLE IF NOT EXISTS states(user_id INTEGER PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}')"),
+    q("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY)"),
+    q("CREATE TABLE IF NOT EXISTS states(user_id INTEGER PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}')"),
+    q("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)"),
+    q("CREATE TABLE IF NOT EXISTS cart(user_id INTEGER NOT NULL, product_id INTEGER NOT NULL, qty INTEGER NOT NULL, " +
+      "PRIMARY KEY(user_id, product_id))"),
+    q("CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, " +
+      "username TEXT NOT NULL DEFAULT '', first_name TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', " +
+      "status TEXT NOT NULL DEFAULT 'new', total REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (datetime('now')))"),
+    q("CREATE TABLE IF NOT EXISTS order_items(id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, " +
+      "product_id INTEGER, name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL)"),
   ]);
   dbReady = true;
 }
@@ -145,6 +161,212 @@ const setState = (env, uid, state, data = {}) =>
     uid, state, JSON.stringify(data));
 const clearState = (env, uid) => run(env, "DELETE FROM states WHERE user_id = ?", uid);
 
+const getSetting = async (env, key) =>
+  (await first(env, "SELECT value FROM settings WHERE key = ?", key))?.value || "";
+const setSetting = (env, key, value) =>
+  run(env, "INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    key, value);
+const delSetting = (env, key) => run(env, "DELETE FROM settings WHERE key = ?", key);
+
+// ------------------------------------------------------------------ корзина
+
+const cartCount = async (env, uid) =>
+  (await first(env, "SELECT COALESCE(SUM(qty), 0) AS n FROM cart WHERE user_id = ?", uid)).n;
+
+/** Приводит корзину в порядок (удалённые товары, закончившийся остаток) и возвращает строки. */
+async function cartRows(env, uid) {
+  await run(env,
+    "DELETE FROM cart WHERE user_id = ? AND (product_id NOT IN (SELECT id FROM products) " +
+    "OR product_id IN (SELECT id FROM products WHERE stock <= 0))", uid);
+  await run(env,
+    "UPDATE cart SET qty = (SELECT stock FROM products WHERE id = cart.product_id) " +
+    "WHERE user_id = ? AND qty > (SELECT stock FROM products WHERE id = cart.product_id)", uid);
+  return all(env,
+    "SELECT c.product_id, c.qty, p.name, p.price, p.stock FROM cart c " +
+    "JOIN products p ON p.id = c.product_id WHERE c.user_id = ? ORDER BY c.rowid", uid);
+}
+
+async function cartView(env, uid) {
+  const before = await cartCount(env, uid);
+  const rows = await cartRows(env, uid);
+  const after = rows.reduce((s, r) => s + r.qty, 0);
+  const note = before !== after ? "\n⚠️ Наличие изменилось, корзина обновлена." : "";
+
+  if (!rows.length) {
+    return {
+      text: "🧺 <b>Корзина пуста</b>" + note + "\n\nДобавьте товары из каталога кнопкой «🛒 В корзину».",
+      markup: kb([[btn("📚 В каталог", "menu")]]),
+    };
+  }
+  const total = rows.reduce((s, r) => s + r.price * r.qty, 0);
+  const lines = rows.map((r, i) =>
+    `${i + 1}. ${esc(r.name)} × ${r.qty} — ${fmtPrice(r.price * r.qty)} ${cur(env)}`);
+  const text =
+    "🧺 <b>Ваша корзина</b>\n\n" + lines.join("\n") +
+    `\n\n<b>Итого: ${fmtPrice(total)} ${cur(env)}</b>` + note +
+    "\n\nБронь на самовывоз, оплата при получении.";
+  const mk = rows.map((r) => [
+    btn("➖", `cart:dec:${r.product_id}`),
+    btn(`${short(r.name)} ×${r.qty}`, "noop"),
+    btn("➕", `cart:inc:${r.product_id}`),
+  ]);
+  mk.push([btn("🗑 Очистить", "cart:clear"), btn("✅ Забронировать", "cart:go")]);
+  mk.push([btn("📚 В каталог", "menu")]);
+  return { text, markup: kb(mk) };
+}
+
+// ------------------------------------------------------------------ брони
+
+const STATUS = {
+  new: "🆕 Новая",
+  confirmed: "✅ Подтверждена",
+  done: "📦 Выдана",
+  cancelled: "❌ Отменена",
+};
+const STATUS_USER = {
+  new: "🆕 ждёт подтверждения",
+  confirmed: "✅ подтверждена, ждёт вас",
+  done: "📦 выдана",
+  cancelled: "❌ отменена",
+};
+
+function userLink(o) {
+  const name = esc(o.first_name || "клиент");
+  const tag = o.username ? ` (@${esc(o.username)})` : "";
+  return `<a href="tg://user?id=${o.user_id}">${name}</a>${tag}`;
+}
+
+async function orderText(env, o, admin) {
+  const items = await all(env, "SELECT name, price, qty FROM order_items WHERE order_id = ? ORDER BY id", o.id);
+  const lines = items.map((i, n) =>
+    `${n + 1}. ${esc(i.name)} × ${i.qty} — ${fmtPrice(i.price * i.qty)} ${cur(env)}`);
+  const parts = [`🧾 <b>Бронь №${o.id}</b> · ${STATUS[o.status] || o.status}`, ""];
+  if (admin) parts.push(`👤 ${userLink(o)}`, `📞 ${esc(o.contact)}`, "");
+  parts.push(...lines, "", `<b>Итого: ${fmtPrice(o.total)} ${cur(env)}</b>`);
+  if (!admin) parts.push("", "Самовывоз, оплата при получении.");
+  return parts.join("\n");
+}
+
+function orderButtons(o) {
+  const rows = [];
+  if (o.status === "new") {
+    rows.push([btn("✅ Подтвердить", `ord:${o.id}:confirm`), btn("❌ Отменить", `ord:${o.id}:cancel`)]);
+  } else if (o.status === "confirmed") {
+    rows.push([btn("📦 Выдан", `ord:${o.id}:done`), btn("❌ Отменить", `ord:${o.id}:cancel`)]);
+  }
+  rows.push([btn("📋 Все брони", "adm:orders")]);
+  return kb(rows);
+}
+
+async function myOrdersText(env, uid) {
+  const orders = await all(env, "SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 5", uid);
+  if (!orders.length) return "📋 <b>Мои брони</b>\n\nПока нет ни одной брони.";
+  const ids = orders.map((o) => o.id);
+  const items = await all(env,
+    `SELECT order_id, name, qty FROM order_items WHERE order_id IN (${ids.map(() => "?").join(",")}) ORDER BY id`,
+    ...ids);
+  const blocks = orders.map((o) => {
+    const list = items.filter((i) => i.order_id === o.id).map((i) => `${esc(i.name)} ×${i.qty}`).join(", ");
+    return `<b>№${o.id}</b> · ${fmtPrice(o.total)} ${cur(env)} · ${STATUS_USER[o.status] || o.status}\n${list}`;
+  });
+  return "📋 <b>Мои брони</b>\n\n" + blocks.join("\n\n");
+}
+
+async function placeOrder(env, m, contact) {
+  const uid = m.from.id;
+  const chat = m.chat.id;
+  await clearState(env, uid);
+
+  const rows = await cartRows(env, uid);
+  if (!rows.length) {
+    return send(env, chat, "Корзина пуста.", kb([[btn("📚 В каталог", "menu")]]));
+  }
+
+  // резервируем остаток; если что-то не получилось, откатываем уже зарезервированное
+  const reserved = [];
+  let failed = null;
+  for (const r of rows) {
+    const res = await run(env,
+      "UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?", r.qty, r.product_id, r.qty);
+    if (res.meta.changes === 1) reserved.push(r);
+    else { failed = r; break; }
+  }
+  if (failed) {
+    for (const r of reserved) {
+      await run(env, "UPDATE products SET stock = stock + ? WHERE id = ?", r.qty, r.product_id);
+    }
+    return send(env, chat,
+      `😔 Пока вы оформляли бронь, «${esc(failed.name)}» закончился в нужном количестве. Проверьте корзину.`,
+      kb([[btn("🧺 Корзина", "cart:view")]]));
+  }
+
+  const total = rows.reduce((s, r) => s + r.price * r.qty, 0);
+  const res = await run(env,
+    "INSERT INTO orders(user_id, username, first_name, contact, status, total) VALUES (?, ?, ?, ?, 'new', ?)",
+    uid, m.from.username || "", m.from.first_name || "", contact, total);
+  const oid = res.meta.last_row_id;
+  await env.DB.batch(rows.map((r) =>
+    env.DB.prepare("INSERT INTO order_items(order_id, product_id, name, price, qty) VALUES (?, ?, ?, ?, ?)")
+      .bind(oid, r.product_id, r.name, r.price, r.qty)));
+  await run(env, "DELETE FROM cart WHERE user_id = ?", uid);
+
+  const o = await first(env, "SELECT * FROM orders WHERE id = ?", oid);
+  await send(env, chat,
+    `✅ <b>Бронь №${oid} принята!</b>\n\n` + (await orderText(env, o, false)) +
+    "\n\nМенеджер скоро свяжется с вами. Статус смотрите в «📋 Мои брони».",
+    kb([[btn("📋 Мои брони", "my")], [btn("📚 В каталог", "menu")]]));
+
+  const adminText = "🔔 <b>Новая бронь!</b>\n\n" + (await orderText(env, o, true));
+  for (const id of adminIds(env)) {
+    try { await send(env, id, adminText, orderButtons(o)); }
+    catch (e) { console.log("Не удалось уведомить админа", id, e); }
+  }
+}
+
+async function orderCallback(env, cb, id, act) {
+  const msg = cb.message;
+  const o = await first(env, "SELECT * FROM orders WHERE id = ?", id);
+  if (!o) return warn(env, cb, "Бронь не найдена");
+
+  if (act === "view") {
+    await show(env, msg, await orderText(env, o, true), orderButtons(o));
+    return;
+  }
+
+  const rule = {
+    confirm: { to: "confirmed", from: ["new"] },
+    done: { to: "done", from: ["new", "confirmed"] },
+    cancel: { to: "cancelled", from: ["new", "confirmed"] },
+  }[act];
+  if (!rule) return;
+
+  const res = await run(env,
+    `UPDATE orders SET status = ? WHERE id = ? AND status IN (${rule.from.map(() => "?").join(",")})`,
+    rule.to, id, ...rule.from);
+  const fresh = await first(env, "SELECT * FROM orders WHERE id = ?", id);
+  if (res.meta.changes !== 1) {
+    await show(env, msg, await orderText(env, fresh, true), orderButtons(fresh));
+    return warn(env, cb, "Статус уже изменён");
+  }
+
+  if (rule.to === "cancelled") {
+    const items = await all(env, "SELECT product_id, qty FROM order_items WHERE order_id = ?", id);
+    for (const it of items) {
+      if (it.product_id != null) {
+        await run(env, "UPDATE products SET stock = stock + ? WHERE id = ?", it.qty, it.product_id);
+      }
+    }
+  }
+  await show(env, msg, await orderText(env, fresh, true), orderButtons(fresh));
+
+  const notice = {
+    confirmed: `✅ Бронь №${id} подтверждена. Товар ждёт вас, приходите за ним.`,
+    done: `📦 Бронь №${id} выдана. Спасибо за покупку!`,
+    cancelled: `❌ Бронь №${id} отменена. Если это ошибка, свяжитесь с менеджером.`,
+  }[rule.to];
+  await send(env, o.user_id, notice, kb([[btn("📋 Мои брони", "my")]]));
+}
+
 // ------------------------------------------------------------------ внешний вид
 
 const AGE_TEXT = "🔞 Каталог только для лиц старше 18 лет.\nВам уже исполнилось 18?";
@@ -152,43 +374,86 @@ const ADMIN_TEXT =
   "⚙️ <b>Админ-панель</b>\n\n" +
   "Чтобы изменить товар, откройте его в каталоге: под карточкой появятся кнопки " +
   "управления (остаток, цена, описание, фото, удаление).\n\n" +
+  "Новые брони приходят сюда сообщением с кнопками статуса. " +
+  "Чтобы они приходили, один раз нажмите /start у бота.\n\n" +
+  "/active — активные брони\n/banner — картинка на главном экране\n" +
   "/stats — статистика\n/export — выгрузить товары файлом\n/cancel — отменить ввод";
 
 const adminPanel = () =>
-  kb([[btn("➕ Добавить товар", "adm:add")], [btn("📚 Открыть каталог", "menu")]]);
+  kb([
+    [btn("➕ Добавить товар", "adm:add")],
+    [btn("📋 Активные брони", "adm:orders")],
+    [btn("📚 Открыть каталог", "menu")],
+  ]);
 
 const askAge = (env, chat) =>
   send(env, chat, AGE_TEXT,
     kb([[btn("Да, мне есть 18", "age:yes"), btn("Нет", "age:no")]]));
 
 async function menuText(env) {
-  const head = `<b>${esc(shopName(env))}</b>\n`;
+  const head = `✨ <b>${esc(shopName(env))}</b> ✨\n`;
   if (!(await catsWithProducts(env)).length) return head + "Каталог пока пуст.";
-  return head + "Выберите категорию или отправьте название товара для поиска.";
+  return head + "Выберите раздел каталога или отправьте название товара для поиска 👇";
 }
 
 async function mainMenu(env, uid) {
   const rows = (await catsWithProducts(env)).map((c) => [btn(`${c.name} (${c.n})`, `cat:${c.id}:0`)]);
+  const n = await cartCount(env, uid);
+  rows.push([btn(n ? `🧺 Корзина (${n})` : "🧺 Корзина", "cart:view"), btn("📋 Мои брони", "my")]);
   if (manager(env)) rows.push([urlBtn("💬 Написать менеджеру", `https://t.me/${manager(env)}`)]);
   if (isAdmin(env, uid)) rows.push([btn("⚙️ Админ-панель", "adm:panel")]);
   return kb(rows);
+}
+
+/** Главное меню новым сообщением (с картинкой-баннером, если админ её задал). */
+async function sendMenu(env, chat, uid) {
+  const text = await menuText(env);
+  const markup = await mainMenu(env, uid);
+  const banner = await getSetting(env, "banner");
+  if (banner) {
+    const r = await tg(env, "sendPhoto", {
+      chat_id: chat, photo: banner, caption: text, parse_mode: "HTML", reply_markup: markup,
+    });
+    if (r.ok) return;
+  }
+  return send(env, chat, text, markup);
+}
+
+/** Главное меню на месте текущего сообщения. */
+async function showMenu(env, msg, uid) {
+  if (await getSetting(env, "banner")) {
+    await del(env, msg);
+    return sendMenu(env, msg.chat.id, uid);
+  }
+  return show(env, msg, await menuText(env), await mainMenu(env, uid));
 }
 
 const productLine = (env, p) =>
   `${p.stock > 0 ? "" : "❌ "}${p.name} — ${fmtPrice(p.price)} ${cur(env)}`;
 
 function productText(env, p) {
-  const stock = p.stock > 0 ? `✅ В наличии: ${p.stock} шт.` : "❌ Нет в наличии";
-  const parts = [`<b>${esc(p.name)}</b>`, `💰 ${fmtPrice(p.price)} ${cur(env)}`, stock];
+  let stock;
+  if (p.stock <= 0) stock = "❌ Нет в наличии";
+  else if (p.stock <= 3) stock = `⚠️ Осталось ${p.stock} шт.`;
+  else stock = `✅ В наличии: ${p.stock} шт.`;
+  const parts = [
+    `<b>${esc(p.name)}</b>`,
+    `<i>${esc(p.category)}</i>`,
+    "",
+    `💰 <b>${fmtPrice(p.price)} ${esc(cur(env))}</b>`,
+    stock,
+  ];
   if (p.description) parts.push("", esc(p.description));
   return parts.join("\n");
 }
 
-function cardMarkup(env, p, page, admin) {
+function cardMarkup(env, p, page, admin, n = 0) {
   const rows = [];
+  rows.push([p.stock > 0 ? btn("🛒 В корзину", `add:${p.id}:${page}`) : btn("🔔 Нет в наличии", "noop")]);
+  if (n > 0) rows.push([btn(`🧺 Корзина (${n})`, "cart:view")]);
   if (manager(env)) {
-    rows.push([urlBtn("🛒 Заказать у менеджера",
-      `https://t.me/${manager(env)}?text=${encodeURIComponent(p.name)}`)]);
+    rows.push([urlBtn("💬 Спросить менеджера",
+      `https://t.me/${manager(env)}?text=${encodeURIComponent("Вопрос по товару: " + p.name)}`)]);
   }
   if (admin) {
     rows.push([btn("➖ 1 шт.", `stk:${p.id}:-1:${page}`), btn("➕ 1 шт.", `stk:${p.id}:1:${page}`)]);
@@ -202,7 +467,7 @@ function cardMarkup(env, p, page, admin) {
 
 async function sendCard(env, chat, p, page = 0, admin = false) {
   const text = productText(env, p);
-  const markup = cardMarkup(env, p, page, admin);
+  const markup = cardMarkup(env, p, page, admin, await cartCount(env, chat));
   if (p.photo) {
     const r = await tg(env, "sendPhoto", {
       chat_id: chat, photo: p.photo, caption: text, parse_mode: "HTML", reply_markup: markup,
@@ -212,9 +477,9 @@ async function sendCard(env, chat, p, page = 0, admin = false) {
   return send(env, chat, text, markup);
 }
 
-function refreshCard(env, msg, p, page, admin) {
+async function refreshCard(env, msg, p, page, admin, uid) {
   const text = productText(env, p);
-  const markup = cardMarkup(env, p, page, admin);
+  const markup = cardMarkup(env, p, page, admin, await cartCount(env, uid));
   if (msg.photo) {
     return tg(env, "editMessageCaption", {
       chat_id: msg.chat.id, message_id: msg.message_id, caption: text,
@@ -235,10 +500,8 @@ async function onMessage(env, m) {
   if (text.startsWith("/")) return onCommand(env, m, text.split(/[\s@]/)[0].toLowerCase());
 
   const st = await getState(env, uid);
-  if (st) {
-    if (isAdmin(env, uid)) return onState(env, m, st);
-    await clearState(env, uid);
-  }
+  if (st) return onState(env, m, st);
+
   if (!text) return;
   if (!(await isConfirmed(env, uid))) return askAge(env, chat);
 
@@ -252,6 +515,19 @@ async function onMessage(env, m) {
   return send(env, chat, `Найдено: ${found.length}`, kb(rows));
 }
 
+async function activeOrdersScreen(env) {
+  const orders = await all(env,
+    "SELECT * FROM orders WHERE status IN ('new', 'confirmed') ORDER BY id DESC LIMIT 15");
+  const rows = orders.map((o) => [btn(
+    `№${o.id} · ${short(o.first_name || "клиент", 12)} · ${fmtPrice(o.total)} ${cur(env)} · ${o.status === "new" ? "🆕" : "✅"}`,
+    `ord:${o.id}:view`)]);
+  rows.push([btn("⬅️ Админ-панель", "adm:panel")]);
+  return {
+    text: orders.length ? `📋 <b>Активные брони (${orders.length})</b>` : "📋 Активных броней нет.",
+    markup: kb(rows),
+  };
+}
+
 async function onCommand(env, m, cmd) {
   const uid = m.from.id;
   const chat = m.chat.id;
@@ -261,24 +537,39 @@ async function onCommand(env, m, cmd) {
     case "/start":
       await clearState(env, uid);
       if (!(await isConfirmed(env, uid))) return askAge(env, chat);
-      return send(env, chat, await menuText(env), await mainMenu(env, uid));
+      return sendMenu(env, chat, uid);
     case "/id":
       return send(env, chat, `Ваш Telegram ID: <code>${uid}</code>`);
     case "/cancel":
       await clearState(env, uid);
       return send(env, chat, "Отменено.");
+    case "/orders":
+      if (!(await isConfirmed(env, uid))) return askAge(env, chat);
+      return send(env, chat, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "menu")]]));
+    case "/active": {
+      if (!admin) return;
+      const s = await activeOrdersScreen(env);
+      return send(env, chat, s.text, s.markup);
+    }
     case "/admin":
       if (!admin) return;
       await clearState(env, uid);
       return send(env, chat, ADMIN_TEXT, adminPanel());
+    case "/banner":
+      if (!admin) return;
+      await setState(env, uid, "banner", {});
+      return send(env, chat,
+        "Отправьте картинку для главного экрана (или «-», чтобы убрать).\n/cancel — отмена");
     case "/stats": {
       if (!admin) return;
       const t = await first(env, "SELECT COUNT(*) AS n FROM products");
       const o = await first(env, "SELECT COUNT(*) AS n FROM products WHERE stock <= 0");
       const u = await first(env, "SELECT COUNT(*) AS n FROM users");
+      const a = await first(env, "SELECT COUNT(*) AS n FROM orders WHERE status IN ('new', 'confirmed')");
       const c = await catsWithProducts(env);
       return send(env, chat,
-        `Товаров: ${t.n} (нет в наличии: ${o.n})\nКатегорий: ${c.length}\nПодтвердили 18+: ${u.n}`);
+        `Товаров: ${t.n} (нет в наличии: ${o.n})\nКатегорий: ${c.length}\n` +
+        `Активных броней: ${a.n}\nПодтвердили 18+: ${u.n}`);
     }
     case "/export": {
       if (!admin) return;
@@ -293,7 +584,7 @@ async function onCommand(env, m, cmd) {
   }
 }
 
-// ------------------------------------------------------------------ диалоги админа
+// ------------------------------------------------------------------ диалоги
 
 const EDIT_PROMPTS = {
   name: "Введите новое название:",
@@ -310,7 +601,29 @@ async function onState(env, m, st) {
   const text = (m.text || "").trim();
   const d = st.data;
 
+  // диалог покупателя: контакты для брони
+  if (st.state === "order_contact") {
+    if (text.length < 5) {
+      return send(env, chat, "Напишите имя и телефон одним сообщением, например:\nИван, +7 900 000-00-00");
+    }
+    return placeOrder(env, m, text.slice(0, 200));
+  }
+
+  // остальные диалоги только для админов
+  if (!isAdmin(env, uid)) {
+    await clearState(env, uid);
+    return;
+  }
+
   switch (st.state) {
+    case "banner": {
+      if (m.photo) await setSetting(env, "banner", m.photo[m.photo.length - 1].file_id);
+      else if (text === "-") await delSetting(env, "banner");
+      else return send(env, chat, "Отправьте картинку или «-».");
+      await clearState(env, uid);
+      await send(env, chat, "✅ Готово. Так теперь выглядит главный экран:");
+      return sendMenu(env, chat, uid);
+    }
     case "add_newcat": {
       const name = text.slice(0, 40);
       if (!name) return send(env, chat, "Введите название категории.");
@@ -384,6 +697,8 @@ async function onState(env, m, st) {
 
 // ------------------------------------------------------------------ кнопки
 
+const ADMIN_ACTIONS = ["adm", "stk", "del", "delok", "ed", "addcat", "ord"];
+
 async function onCallback(env, cb) {
   const answered = await route(env, cb);
   if (!answered) await ack(env, cb);
@@ -403,11 +718,11 @@ async function route(env, cb) {
       return;
     }
     await run(env, "INSERT OR IGNORE INTO users(id) VALUES (?)", uid);
-    await edit(env, msg, await menuText(env), await mainMenu(env, uid));
+    await showMenu(env, msg, uid);
     return;
   }
 
-  if (["adm", "stk", "del", "delok", "ed", "addcat"].includes(a)) {
+  if (ADMIN_ACTIONS.includes(a)) {
     if (!isAdmin(env, uid)) return warn(env, cb, "Нет доступа");
     return adminCallback(env, cb, a, b, c, d);
   }
@@ -417,12 +732,19 @@ async function route(env, cb) {
   switch (a) {
     case "menu":
       await clearState(env, uid);
-      await show(env, msg, await menuText(env), await mainMenu(env, uid));
+      await showMenu(env, msg, uid);
       return;
     case "cat":
       return openCategory(env, cb, Number(b), Number(c));
     case "item":
       return openItem(env, cb, Number(b), Number(c));
+    case "add":
+      return addToCart(env, cb, Number(b), Number(c));
+    case "cart":
+      return cartAction(env, cb, b, Number(c));
+    case "my":
+      await show(env, msg, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "menu")]]));
+      return;
   }
 }
 
@@ -432,7 +754,7 @@ async function openCategory(env, cb, cid, page) {
   const items = await productsIn(env, cid);
   if (!cat || !items.length) {
     await warn(env, cb, "Категория пуста или изменилась");
-    await show(env, msg, await menuText(env), await mainMenu(env, cb.from.id));
+    await showMenu(env, msg, cb.from.id);
     return true;
   }
   const pages = Math.floor((items.length - 1) / PAGE_SIZE) + 1;
@@ -440,29 +762,77 @@ async function openCategory(env, cb, cid, page) {
   const rows = items
     .slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
     .map((p) => [btn(productLine(env, p), `item:${p.id}:${page}`)]);
-  const nav = [];
-  if (page > 0) nav.push(btn("◀️", `cat:${cid}:${page - 1}`));
-  nav.push(btn(`${page + 1}/${pages}`, "noop"));
-  if (page < pages - 1) nav.push(btn("▶️", `cat:${cid}:${page + 1}`));
-  rows.push(nav, [btn("⬅️ В меню", "menu")]);
-  await show(env, msg, `<b>${esc(cat.name)}</b>`, kb(rows));
+  if (pages > 1) {
+    const nav = [];
+    if (page > 0) nav.push(btn("◀️", `cat:${cid}:${page - 1}`));
+    nav.push(btn(`${page + 1}/${pages}`, "noop"));
+    if (page < pages - 1) nav.push(btn("▶️", `cat:${cid}:${page + 1}`));
+    rows.push(nav);
+  }
+  rows.push([btn("🧺 Корзина", "cart:view"), btn("⬅️ В меню", "menu")]);
+  await show(env, msg, `<b>${esc(cat.name)}</b>\nВыберите товар 👇`, kb(rows));
 }
 
 async function openItem(env, cb, pid, page) {
   const msg = cb.message;
-  const admin = isAdmin(env, cb.from.id);
+  const uid = cb.from.id;
+  const admin = isAdmin(env, uid);
   const p = await getProduct(env, pid);
   if (!p) {
     await warn(env, cb, "Товар больше недоступен");
-    await show(env, msg, await menuText(env), await mainMenu(env, cb.from.id));
+    await showMenu(env, msg, uid);
     return true;
   }
   if (p.photo || msg.photo) {
     await del(env, msg);
     await sendCard(env, msg.chat.id, p, page, admin);
   } else {
-    await edit(env, msg, productText(env, p), cardMarkup(env, p, page, admin));
+    await edit(env, msg, productText(env, p), cardMarkup(env, p, page, admin, await cartCount(env, uid)));
   }
+}
+
+async function addToCart(env, cb, pid, page) {
+  const uid = cb.from.id;
+  const p = await getProduct(env, pid);
+  if (!p || p.stock <= 0) return warn(env, cb, "Этого товара уже нет в наличии");
+  const row = await first(env, "SELECT qty FROM cart WHERE user_id = ? AND product_id = ?", uid, pid);
+  const qty = row ? row.qty : 0;
+  if (qty + 1 > p.stock) return toast(env, cb, `В наличии только ${p.stock} шт., они уже в корзине`);
+  await run(env,
+    "INSERT INTO cart(user_id, product_id, qty) VALUES (?, ?, 1) " +
+    "ON CONFLICT(user_id, product_id) DO UPDATE SET qty = qty + 1", uid, pid);
+  await refreshCard(env, cb.message, p, page, isAdmin(env, uid), uid);
+  return toast(env, cb, `Добавлено в корзину ✅ (${qty + 1} шт.)`);
+}
+
+async function cartAction(env, cb, act, pid) {
+  const uid = cb.from.id;
+  const msg = cb.message;
+  let answered = false;
+
+  if (act === "inc") {
+    const p = await getProduct(env, pid);
+    const row = await first(env, "SELECT qty FROM cart WHERE user_id = ? AND product_id = ?", uid, pid);
+    if (!p || !row || row.qty + 1 > p.stock) answered = await toast(env, cb, "Больше нет в наличии");
+    else await run(env, "UPDATE cart SET qty = qty + 1 WHERE user_id = ? AND product_id = ?", uid, pid);
+  } else if (act === "dec") {
+    await run(env, "UPDATE cart SET qty = qty - 1 WHERE user_id = ? AND product_id = ?", uid, pid);
+    await run(env, "DELETE FROM cart WHERE user_id = ? AND qty <= 0", uid);
+  } else if (act === "clear") {
+    await run(env, "DELETE FROM cart WHERE user_id = ?", uid);
+  } else if (act === "go") {
+    const rows = await cartRows(env, uid);
+    if (!rows.length) return toast(env, cb, "Корзина пуста");
+    await setState(env, uid, "order_contact", {});
+    await send(env, msg.chat.id,
+      "📝 <b>Оформление брони</b>\n\nНапишите одним сообщением, как к вам обращаться и ваш телефон, например:\n" +
+      "<i>Иван, +7 900 000-00-00</i>\n\n/cancel — отмена");
+    return;
+  }
+
+  const v = await cartView(env, uid);
+  await show(env, msg, v.text, v.markup);
+  return answered || undefined;
 }
 
 async function adminCallback(env, cb, a, b, c, d) {
@@ -478,16 +848,21 @@ async function adminCallback(env, cb, a, b, c, d) {
         const rows = cats.map((x) => [btn(x.name, `addcat:${x.id}`)]);
         rows.push([btn("➕ Новая категория", "addcat:new")], [btn("✖️ Отмена", "adm:cancel")]);
         await show(env, msg, "Выберите категорию для нового товара:", kb(rows));
+      } else if (b === "orders") {
+        const s = await activeOrdersScreen(env);
+        await show(env, msg, s.text, s.markup);
       } else {
         await show(env, msg, ADMIN_TEXT, adminPanel());
       }
       return;
     }
+    case "ord":
+      return orderCallback(env, cb, Number(b), c);
     case "stk": {
       const pid = Number(b);
       if (!(await getProduct(env, pid))) return warn(env, cb, "Товар не найден");
       await run(env, "UPDATE products SET stock = MAX(0, stock + ?) WHERE id = ?", Number(c), pid);
-      await refreshCard(env, msg, await getProduct(env, pid), Number(d) || 0, true);
+      await refreshCard(env, msg, await getProduct(env, pid), Number(d) || 0, true, uid);
       return;
     }
     case "del": {
@@ -512,7 +887,8 @@ async function adminCallback(env, cb, a, b, c, d) {
     case "addcat": {
       if (b === "new") {
         await setState(env, uid, "add_newcat", {});
-        await send(env, chat, "Введите название новой категории:\n/cancel — отмена");
+        await send(env, chat,
+          "Введите название новой категории. Можно с эмодзи, например: 💨 Испарители\n/cancel — отмена");
         return;
       }
       const row = await first(env, "SELECT name FROM categories WHERE id = ?", Number(b));
