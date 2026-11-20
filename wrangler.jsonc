@@ -17,7 +17,7 @@
   // Обычные настройки. Менять можно прямо на GitHub: Cloudflare сам обновит бота.
   // BOT_TOKEN и WEBHOOK_SECRET сюда НЕ пишите: они задаются секретами в Cloudflare.
   "vars": {
-    "SHOP_NAME": "Мой магазин",
+    "SHOP_NAME": "Sweet Store",
     "CURRENCY": "₽",
     "MANAGER_USERNAME": "",
     "ADMIN_IDS": "926127746,6122323121"
