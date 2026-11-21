@@ -305,9 +305,10 @@ async function bonusScreen(env, uid) {
 const SUPPORT_GAP_MS = 5000; // защита от потока сообщений от одного клиента
 const SUPPORT_MAX_TEXT = 1500;
 
-/** Писать магазину можно только после первой брони (любой, даже отменённой). */
+/** Писать магазину можно, пока у клиента есть активная бронь: новая или подтверждённая. */
 const hasOrders = async (env, uid) =>
-  !!(await first(env, "SELECT 1 AS x FROM orders WHERE user_id = ? LIMIT 1", uid));
+  !!(await first(env,
+    "SELECT 1 AS x FROM orders WHERE user_id = ? AND status IN ('new', 'confirmed') LIMIT 1", uid));
 
 /** Кнопки под списком «Мои брони»: «Связаться с магазином» только если есть брони. */
 const ordersMarkup = async (env, uid) =>
@@ -359,7 +360,9 @@ async function forwardToAdmins(env, m) {
 
 /** Ответ админа → клиенту. Остальным админам тоже показываем, кто и что ответил. */
 async function replyToClient(env, clientId, m) {
-  const markup = kb([[btn("✉️ Ответить магазину", "sup:start")], [btn("🏠 Меню", "menu")]]);
+  const markup = kb((await hasOrders(env, clientId))
+    ? [[btn("✉️ Ответить магазину", "sup:start")], [btn("🏠 Меню", "menu")]]
+    : [[btn("🏠 Меню", "menu")]]);
   let r;
   if (m.text) {
     const body = m.text.length > 3500 ? m.text.slice(0, 3500) + "…" : m.text;
@@ -569,7 +572,9 @@ async function orderCallback(env, cb, id, act) {
     done: `📦 Бронь №${id} выдана. Спасибо за покупку!`,
     cancelled: `❌ Бронь №${id} отменена. Если это ошибка, свяжитесь с менеджером.`,
   }[rule.to] + extra;
-  await send(env, o.user_id, notice, kb([[btn("📋 Мои брони", "my")], [btn("✉️ Связаться с магазином", "sup:start")]]));
+  const noticeRows = [[btn("📋 Мои брони", "my")]];
+  if (await hasOrders(env, o.user_id)) noticeRows.push([btn("✉️ Связаться с магазином", "sup:start")]);
+  await send(env, o.user_id, notice, kb(noticeRows));
 }
 
 // ------------------------------------------------------------------ внешний вид
@@ -919,6 +924,12 @@ async function onState(env, m, st) {
 
   // диалог покупателя: сообщение магазину
   if (st.state === "support") {
+    if (!(await hasOrders(env, uid))) {
+      await clearState(env, uid);
+      return send(env, chat,
+        "Писать магазину можно, пока у вас есть активная бронь. Выберите товар и забронируйте его.",
+        kb([[btn("🛍 Каталог", "catalog")], [btn("🏠 Меню", "menu")]]));
+    }
     const last = Number(await getSetting(env, `sup:${uid}`)) || 0;
     if (Date.now() - last < SUPPORT_GAP_MS) {
       return send(env, chat, "⏳ Слишком часто. Подождите несколько секунд и отправьте сообщение ещё раз.");
@@ -1087,7 +1098,7 @@ async function route(env, cb) {
       return cartAction(env, cb, b, Number(c));
     case "sup":
       if (!(await hasOrders(env, uid))) {
-        return warn(env, cb, "Написать магазину можно после первой брони. Выберите товар и забронируйте его.");
+        return warn(env, cb, "Написать магазину можно, пока у вас есть активная бронь. Выберите товар и забронируйте его.");
       }
       await setState(env, uid, "support", {});
       await send(env, msg.chat.id,
