@@ -31,6 +31,8 @@ const manager = (env) => String(env.MANAGER_USERNAME || "").replace(/^@/, "");
 const adminIds = (env) =>
   String(env.ADMIN_IDS || "").split(",").map((s) => s.trim()).filter(Boolean).map(Number);
 const isAdmin = (env, uid) => adminIds(env).includes(Number(uid));
+/** Админ, который сейчас в админ-режиме (не переключился на вид покупателя). */
+const asAdmin = async (env, uid) => isAdmin(env, uid) && !(await getSetting(env, `cv:${uid}`));
 
 const btn = (text, data) => ({ text, callback_data: data });
 const urlBtn = (text, url) => ({ text, url });
@@ -96,7 +98,7 @@ async function initDb(env) {
   if (dbReady) return;
   const q = (sql) => env.DB.prepare(sql);
   await env.DB.batch([
-    q("CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)"),
+    q("CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, photo TEXT NOT NULL DEFAULT '')"),
     q("CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER NOT NULL, " +
       "name TEXT NOT NULL, price REAL NOT NULL DEFAULT 0, stock INTEGER NOT NULL DEFAULT 0, " +
       "description TEXT NOT NULL DEFAULT '', photo TEXT NOT NULL DEFAULT '')"),
@@ -111,6 +113,9 @@ async function initDb(env) {
     q("CREATE TABLE IF NOT EXISTS order_items(id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, " +
       "product_id INTEGER, name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL)"),
   ]);
+  // база, созданная старой версией, не имеет колонки photo у разделов
+  try { await env.DB.prepare("ALTER TABLE categories ADD COLUMN photo TEXT NOT NULL DEFAULT ''").run(); }
+  catch { /* колонка уже есть */ }
   dbReady = true;
 }
 
@@ -120,7 +125,7 @@ const first = (env, sql, ...args) => env.DB.prepare(sql).bind(...args).first();
 const run = (env, sql, ...args) => env.DB.prepare(sql).bind(...args).run();
 
 const PRODUCT_SQL =
-  "SELECT p.*, c.name AS category FROM products p JOIN categories c ON c.id = p.category_id";
+  "SELECT p.*, c.name AS category, c.photo AS cat_photo FROM products p JOIN categories c ON c.id = p.category_id";
 
 const getProduct = (env, pid) => first(env, PRODUCT_SQL + " WHERE p.id = ?", pid);
 
@@ -195,7 +200,7 @@ async function cartView(env, uid) {
   if (!rows.length) {
     return {
       text: "🧺 <b>Корзина пуста</b>" + note + "\n\nДобавьте товары из каталога кнопкой «🛒 В корзину».",
-      markup: kb([[btn("📚 В каталог", "menu")]]),
+      markup: kb([[btn("📚 В каталог", "catalog")]]),
     };
   }
   const total = rows.reduce((s, r) => s + r.price * r.qty, 0);
@@ -211,7 +216,7 @@ async function cartView(env, uid) {
     btn("➕", `cart:inc:${r.product_id}`),
   ]);
   mk.push([btn("🗑 Очистить", "cart:clear"), btn("✅ Забронировать", "cart:go")]);
-  mk.push([btn("📚 В каталог", "menu")]);
+  mk.push([btn("📚 В каталог", "catalog")]);
   return { text, markup: kb(mk) };
 }
 
@@ -279,7 +284,7 @@ async function placeOrder(env, m, contact) {
 
   const rows = await cartRows(env, uid);
   if (!rows.length) {
-    return send(env, chat, "Корзина пуста.", kb([[btn("📚 В каталог", "menu")]]));
+    return send(env, chat, "Корзина пуста.", kb([[btn("📚 В каталог", "catalog")]]));
   }
 
   // резервируем остаток; если что-то не получилось, откатываем уже зарезервированное
@@ -314,7 +319,7 @@ async function placeOrder(env, m, contact) {
   await send(env, chat,
     `✅ <b>Бронь №${oid} принята!</b>\n\n` + (await orderText(env, o, false)) +
     "\n\nМенеджер скоро свяжется с вами. Статус смотрите в «📋 Мои брони».",
-    kb([[btn("📋 Мои брони", "my")], [btn("📚 В каталог", "menu")]]));
+    kb([[btn("📋 Мои брони", "my")], [btn("📚 В каталог", "catalog")]]));
 
   const adminText = "🔔 <b>Новая бронь!</b>\n\n" + (await orderText(env, o, true));
   for (const id of adminIds(env)) {
@@ -373,16 +378,18 @@ const AGE_TEXT = "🔞 Каталог только для лиц старше 18
 const ADMIN_TEXT =
   "⚙️ <b>Админ-панель</b>\n\n" +
   "Чтобы изменить товар, откройте его в каталоге: под карточкой появятся кнопки " +
-  "управления (остаток, цена, описание, фото, удаление).\n\n" +
+  "управления (остаток, цена, описание, фото товара и раздела, удаление).\n\n" +
   "Новые брони приходят сюда сообщением с кнопками статуса. " +
   "Чтобы они приходили, один раз нажмите /start у бота.\n\n" +
-  "/active — активные брони\n/banner — картинка на главном экране\n" +
+  "/active — активные брони\n/banner — главная картинка магазина (меню и каталог)\n" +
+  "/user — посмотреть бота глазами покупателя (вернуться: /admin)\n" +
   "/stats — статистика\n/export — выгрузить товары файлом\n/cancel — отменить ввод";
 
 const adminPanel = () =>
   kb([
     [btn("➕ Добавить товар", "adm:add")],
     [btn("📋 Активные брони", "adm:orders")],
+    [btn("👁 Режим покупателя", "adm:off")],
     [btn("📚 Открыть каталог", "menu")],
   ]);
 
@@ -390,19 +397,48 @@ const askAge = (env, chat) =>
   send(env, chat, AGE_TEXT,
     kb([[btn("Да, мне есть 18", "age:yes"), btn("Нет", "age:no")]]));
 
+const welcomeText = (env) =>
+  env.WELCOME_TEXT || "Добро пожаловать! Здесь можно посмотреть каталог и забронировать товар для самовывоза.";
+
 async function menuText(env) {
-  const head = `✨ <b>${esc(shopName(env))}</b> ✨\n`;
+  const head = `✨ <b>${esc(shopName(env))}</b> ✨\n\n`;
   if (!(await catsWithProducts(env)).length) return head + "Каталог пока пуст.";
-  return head + "Выберите раздел каталога или отправьте название товара для поиска 👇";
+  return head + esc(welcomeText(env)) + "\n\n🔎 Ищете что-то конкретное? Просто напишите название товара.";
 }
 
 async function mainMenu(env, uid) {
-  const rows = (await catsWithProducts(env)).map((c) => [btn(`${c.name} (${c.n})`, `cat:${c.id}:0`)]);
   const n = await cartCount(env, uid);
-  rows.push([btn(n ? `🧺 Корзина (${n})` : "🧺 Корзина", "cart:view"), btn("📋 Мои брони", "my")]);
-  if (manager(env)) rows.push([urlBtn("💬 Написать менеджеру", `https://t.me/${manager(env)}`)]);
-  if (isAdmin(env, uid)) rows.push([btn("⚙️ Админ-панель", "adm:panel")]);
+  const rows = [
+    [btn("🛍 Каталог", "catalog")],
+    [btn(n ? `🛒 Забронировать (${n})` : "🛒 Забронировать", "cart:view")],
+    [btn("📋 Мои брони", "my")],
+  ];
+  if (manager(env)) rows[2].push(urlBtn("💬 Менеджер", `https://t.me/${manager(env)}`));
+  if (await asAdmin(env, uid)) rows.push([btn("⚙️ Админ-панель", "adm:panel")]);
+  else if (isAdmin(env, uid)) rows.push([btn("⚙️ Вернуться в админ-режим", "adm:on")]);
   return kb(rows);
+}
+
+/**
+ * Показать экран на месте текущего сообщения. С картинкой: если там уже фото,
+ * заменяем его, иначе удаляем сообщение и шлём новое. Без картинки: обычный текст.
+ */
+async function screen(env, msg, text, markup, photo) {
+  if (!photo) return show(env, msg, text, markup);
+  if (msg.photo) {
+    const r = await tg(env, "editMessageMedia", {
+      chat_id: msg.chat.id, message_id: msg.message_id,
+      media: { type: "photo", media: photo, caption: text, parse_mode: "HTML" },
+      reply_markup: markup,
+    });
+    if (r.ok || /not modified/i.test(r.description || "")) return r;
+  }
+  await del(env, msg);
+  const r = await tg(env, "sendPhoto", {
+    chat_id: msg.chat.id, photo, caption: text, parse_mode: "HTML", reply_markup: markup,
+  });
+  if (r.ok) return r;
+  return send(env, msg.chat.id, text, markup);
 }
 
 /** Главное меню новым сообщением (с картинкой-баннером, если админ её задал). */
@@ -421,11 +457,20 @@ async function sendMenu(env, chat, uid) {
 
 /** Главное меню на месте текущего сообщения. */
 async function showMenu(env, msg, uid) {
-  if (await getSetting(env, "banner")) {
-    await del(env, msg);
-    return sendMenu(env, msg.chat.id, uid);
+  return screen(env, msg, await menuText(env), await mainMenu(env, uid), await getSetting(env, "banner"));
+}
+
+/** Экран «Каталог»: выбор раздела. */
+async function showCatalog(env, msg, uid) {
+  const cats = await catsWithProducts(env);
+  const banner = await getSetting(env, "banner");
+  if (!cats.length) {
+    return screen(env, msg, "🛍 <b>Каталог</b>\n\nПока пусто.", kb([[btn("🏠 Меню", "menu")]]), banner);
   }
-  return show(env, msg, await menuText(env), await mainMenu(env, uid));
+  const n = await cartCount(env, uid);
+  const rows = cats.map((c) => [btn(`${c.name} (${c.n})`, `pg:${c.id}:0`)]);
+  rows.push([btn(n ? `🛒 Забронировать (${n})` : "🛒 Забронировать", "cart:view"), btn("🏠 Меню", "menu")]);
+  return screen(env, msg, "🛍 <b>Каталог</b>\n\nВыберите раздел 👇", kb(rows), banner);
 }
 
 const productLine = (env, p) =>
@@ -447,46 +492,63 @@ function productText(env, p) {
   return parts.join("\n");
 }
 
-function cardMarkup(env, p, page, admin, n = 0) {
+/** Карточка товара. i — номер в разделе (листание ◀️ ▶️) или -1 (без листания, например из поиска). */
+async function cardView(env, p, admin, uid, i) {
+  const n = await cartCount(env, uid);
   const rows = [];
-  rows.push([p.stock > 0 ? btn("🛒 В корзину", `add:${p.id}:${page}`) : btn("🔔 Нет в наличии", "noop")]);
-  if (n > 0) rows.push([btn(`🧺 Корзина (${n})`, "cart:view")]);
+  rows.push([p.stock > 0 ? btn("🛒 В корзину", `add:${p.id}:${i}`) : btn("❌ Нет в наличии", "noop")]);
+  if (n > 0) rows.push([btn(`🧺 Забронировать (${n})`, "cart:view")]);
+  if (i >= 0) {
+    const total = (await first(env, "SELECT COUNT(*) AS n FROM products WHERE category_id = ?", p.category_id)).n;
+    if (total > 1) {
+      rows.push([
+        btn("◀️", `pg:${p.category_id}:${(i - 1 + total) % total}`),
+        btn(`${i + 1} / ${total}`, "noop"),
+        btn("▶️", `pg:${p.category_id}:${(i + 1) % total}`),
+      ]);
+    }
+  }
   if (manager(env)) {
     rows.push([urlBtn("💬 Спросить менеджера",
       `https://t.me/${manager(env)}?text=${encodeURIComponent("Вопрос по товару: " + p.name)}`)]);
   }
   if (admin) {
-    rows.push([btn("➖ 1 шт.", `stk:${p.id}:-1:${page}`), btn("➕ 1 шт.", `stk:${p.id}:1:${page}`)]);
+    rows.push([btn("➖ 1 шт.", `stk:${p.id}:-1:${i}`), btn("➕ 1 шт.", `stk:${p.id}:1:${i}`)]);
     rows.push([btn("✏️ Название", `ed:name:${p.id}`), btn("💰 Цена", `ed:price:${p.id}`)]);
     rows.push([btn("📦 Остаток", `ed:stock:${p.id}`), btn("📝 Описание", `ed:desc:${p.id}`)]);
-    rows.push([btn("🖼 Фото", `ed:photo:${p.id}`), btn("🗑 Удалить", `del:${p.id}`)]);
+    rows.push([btn("🖼 Фото товара", `ed:photo:${p.id}`), btn("🗑 Удалить", `del:${p.id}`)]);
+    rows.push([btn("🖼 Фото раздела", `catph:${p.category_id}`)]);
   }
-  rows.push([btn("⬅️ Назад", `cat:${p.category_id}:${page}`)]);
-  return kb(rows);
+  rows.push([btn("📚 Разделы", "catalog"), btn("🏠 Меню", "menu")]);
+  // у товара нет своего фото — показываем фото его раздела
+  return { text: productText(env, p), markup: kb(rows), photo: p.photo || p.cat_photo || "" };
 }
 
-async function sendCard(env, chat, p, page = 0, admin = false) {
-  const text = productText(env, p);
-  const markup = cardMarkup(env, p, page, admin, await cartCount(env, chat));
-  if (p.photo) {
+async function sendCard(env, chat, p, i = -1, admin = false) {
+  const v = await cardView(env, p, admin, chat, i);
+  if (v.photo) {
     const r = await tg(env, "sendPhoto", {
-      chat_id: chat, photo: p.photo, caption: text, parse_mode: "HTML", reply_markup: markup,
+      chat_id: chat, photo: v.photo, caption: v.text, parse_mode: "HTML", reply_markup: v.markup,
     });
-    if (r.ok) return;
+    if (r.ok) return r;
   }
-  return send(env, chat, text, markup);
+  return send(env, chat, v.text, v.markup);
 }
 
-async function refreshCard(env, msg, p, page, admin, uid) {
-  const text = productText(env, p);
-  const markup = cardMarkup(env, p, page, admin, await cartCount(env, uid));
+async function screenCard(env, msg, p, i, admin, uid) {
+  const v = await cardView(env, p, admin, uid, i);
+  return screen(env, msg, v.text, v.markup, v.photo);
+}
+
+async function refreshCard(env, msg, p, i, admin, uid) {
+  const v = await cardView(env, p, admin, uid, i);
   if (msg.photo) {
     return tg(env, "editMessageCaption", {
-      chat_id: msg.chat.id, message_id: msg.message_id, caption: text,
-      parse_mode: "HTML", reply_markup: markup,
+      chat_id: msg.chat.id, message_id: msg.message_id, caption: v.text,
+      parse_mode: "HTML", reply_markup: v.markup,
     });
   }
-  return edit(env, msg, text, markup);
+  return edit(env, msg, v.text, v.markup);
 }
 
 // ------------------------------------------------------------------ сообщения
@@ -510,7 +572,7 @@ async function onMessage(env, m) {
   if (!found.length) {
     return send(env, chat, "Ничего не найдено. Попробуйте другое слово.", await mainMenu(env, uid));
   }
-  const rows = found.map((p) => [btn(productLine(env, p), `item:${p.id}:0`)]);
+  const rows = found.map((p) => [btn(productLine(env, p), `item:${p.id}:-1`)]);
   rows.push([btn("⬅️ В меню", "menu")]);
   return send(env, chat, `Найдено: ${found.length}`, kb(rows));
 }
@@ -545,7 +607,7 @@ async function onCommand(env, m, cmd) {
       return send(env, chat, "Отменено.");
     case "/orders":
       if (!(await isConfirmed(env, uid))) return askAge(env, chat);
-      return send(env, chat, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "menu")]]));
+      return send(env, chat, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "catalog")]]));
     case "/active": {
       if (!admin) return;
       const s = await activeOrdersScreen(env);
@@ -554,7 +616,14 @@ async function onCommand(env, m, cmd) {
     case "/admin":
       if (!admin) return;
       await clearState(env, uid);
+      await delSetting(env, `cv:${uid}`);
       return send(env, chat, ADMIN_TEXT, adminPanel());
+    case "/user":
+      if (!admin) return;
+      await clearState(env, uid);
+      await setSetting(env, `cv:${uid}`, "1");
+      await send(env, chat, "👁 Режим покупателя включён. Вернуться в админ-режим: /admin");
+      return sendMenu(env, chat, uid);
     case "/banner":
       if (!admin) return;
       await setState(env, uid, "banner", {});
@@ -624,6 +693,15 @@ async function onState(env, m, st) {
       await send(env, chat, "✅ Готово. Так теперь выглядит главный экран:");
       return sendMenu(env, chat, uid);
     }
+    case "catphoto": {
+      let photo;
+      if (m.photo) photo = m.photo[m.photo.length - 1].file_id;
+      else if (text === "-") photo = "";
+      else return send(env, chat, "Отправьте фото или «-».");
+      await run(env, "UPDATE categories SET photo = ? WHERE id = ?", photo, d.cid);
+      await clearState(env, uid);
+      return send(env, chat, "✅ Фото раздела сохранено.", kb([[btn("📚 Открыть раздел", `pg:${d.cid}:0`)]]));
+    }
     case "add_newcat": {
       const name = text.slice(0, 40);
       if (!name) return send(env, chat, "Введите название категории.");
@@ -662,7 +740,7 @@ async function onState(env, m, st) {
         cid, d.name, d.price, d.stock, d.desc, photo);
       await clearState(env, uid);
       await send(env, chat, "✅ Товар добавлен. Ещё один — /admin");
-      return sendCard(env, chat, await getProduct(env, res.meta.last_row_id), 0, true);
+      return sendCard(env, chat, await getProduct(env, res.meta.last_row_id), -1, true);
     }
     case "edit": {
       const { field, pid } = d;
@@ -688,7 +766,7 @@ async function onState(env, m, st) {
       await run(env, `UPDATE products SET ${EDIT_COLUMNS[field]} = ? WHERE id = ?`, value, pid);
       await clearState(env, uid);
       await send(env, chat, "✅ Обновлено");
-      return sendCard(env, chat, await getProduct(env, pid), 0, true);
+      return sendCard(env, chat, await getProduct(env, pid), -1, true);
     }
     default:
       await clearState(env, uid);
@@ -697,7 +775,7 @@ async function onState(env, m, st) {
 
 // ------------------------------------------------------------------ кнопки
 
-const ADMIN_ACTIONS = ["adm", "stk", "del", "delok", "ed", "addcat", "ord"];
+const ADMIN_ACTIONS = ["adm", "stk", "del", "delok", "ed", "addcat", "ord", "catph"];
 
 async function onCallback(env, cb) {
   const answered = await route(env, cb);
@@ -734,8 +812,13 @@ async function route(env, cb) {
       await clearState(env, uid);
       await showMenu(env, msg, uid);
       return;
-    case "cat":
-      return openCategory(env, cb, Number(b), Number(c));
+    case "catalog":
+      await showCatalog(env, msg, uid);
+      return;
+    case "pg":
+      return showPager(env, cb, Number(b), Number(c));
+    case "cat": // старые кнопки из прошлых версий
+      return showPager(env, cb, Number(b), 0);
     case "item":
       return openItem(env, cb, Number(b), Number(c));
     case "add":
@@ -743,55 +826,36 @@ async function route(env, cb) {
     case "cart":
       return cartAction(env, cb, b, Number(c));
     case "my":
-      await show(env, msg, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "menu")]]));
+      await show(env, msg, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "catalog")]]));
       return;
   }
 }
 
-async function openCategory(env, cb, cid, page) {
-  const msg = cb.message;
-  const cat = await first(env, "SELECT name FROM categories WHERE id = ?", cid);
+async function showPager(env, cb, cid, i) {
+  const uid = cb.from.id;
   const items = await productsIn(env, cid);
-  if (!cat || !items.length) {
-    await warn(env, cb, "Категория пуста или изменилась");
-    await showMenu(env, msg, cb.from.id);
+  if (!items.length) {
+    await warn(env, cb, "Раздел пуст или изменился");
+    await showMenu(env, cb.message, uid);
     return true;
   }
-  const pages = Math.floor((items.length - 1) / PAGE_SIZE) + 1;
-  page = Math.max(0, Math.min(page, pages - 1));
-  const rows = items
-    .slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
-    .map((p) => [btn(productLine(env, p), `item:${p.id}:${page}`)]);
-  if (pages > 1) {
-    const nav = [];
-    if (page > 0) nav.push(btn("◀️", `cat:${cid}:${page - 1}`));
-    nav.push(btn(`${page + 1}/${pages}`, "noop"));
-    if (page < pages - 1) nav.push(btn("▶️", `cat:${cid}:${page + 1}`));
-    rows.push(nav);
-  }
-  rows.push([btn("🧺 Корзина", "cart:view"), btn("⬅️ В меню", "menu")]);
-  await show(env, msg, `<b>${esc(cat.name)}</b>\nВыберите товар 👇`, kb(rows));
+  const n = items.length;
+  i = (((Number.isFinite(i) ? i : 0) % n) + n) % n;
+  await screenCard(env, cb.message, items[i], i, await asAdmin(env, uid), uid);
 }
 
-async function openItem(env, cb, pid, page) {
-  const msg = cb.message;
+async function openItem(env, cb, pid, i) {
   const uid = cb.from.id;
-  const admin = isAdmin(env, uid);
   const p = await getProduct(env, pid);
   if (!p) {
     await warn(env, cb, "Товар больше недоступен");
-    await showMenu(env, msg, uid);
+    await showMenu(env, cb.message, uid);
     return true;
   }
-  if (p.photo || msg.photo) {
-    await del(env, msg);
-    await sendCard(env, msg.chat.id, p, page, admin);
-  } else {
-    await edit(env, msg, productText(env, p), cardMarkup(env, p, page, admin, await cartCount(env, uid)));
-  }
+  await screenCard(env, cb.message, p, Number.isFinite(i) ? i : -1, await asAdmin(env, uid), uid);
 }
 
-async function addToCart(env, cb, pid, page) {
+async function addToCart(env, cb, pid, i) {
   const uid = cb.from.id;
   const p = await getProduct(env, pid);
   if (!p || p.stock <= 0) return warn(env, cb, "Этого товара уже нет в наличии");
@@ -801,7 +865,7 @@ async function addToCart(env, cb, pid, page) {
   await run(env,
     "INSERT INTO cart(user_id, product_id, qty) VALUES (?, ?, 1) " +
     "ON CONFLICT(user_id, product_id) DO UPDATE SET qty = qty + 1", uid, pid);
-  await refreshCard(env, cb.message, p, page, isAdmin(env, uid), uid);
+  await refreshCard(env, cb.message, p, Number.isFinite(i) ? i : -1, await asAdmin(env, uid), uid);
   return toast(env, cb, `Добавлено в корзину ✅ (${qty + 1} шт.)`);
 }
 
@@ -843,6 +907,17 @@ async function adminCallback(env, cb, a, b, c, d) {
   switch (a) {
     case "adm": {
       await clearState(env, uid);
+      if (b === "off") {
+        await setSetting(env, `cv:${uid}`, "1");
+        await toast(env, cb, "Режим покупателя. Вернуться: /admin");
+        await showMenu(env, msg, uid);
+        return true;
+      }
+      if (b === "on") {
+        await delSetting(env, `cv:${uid}`);
+        await show(env, msg, ADMIN_TEXT, adminPanel());
+        return;
+      }
       if (b === "add") {
         const cats = await all(env, "SELECT id, name FROM categories ORDER BY name");
         const rows = cats.map((x) => [btn(x.name, `addcat:${x.id}`)]);
@@ -858,18 +933,27 @@ async function adminCallback(env, cb, a, b, c, d) {
     }
     case "ord":
       return orderCallback(env, cb, Number(b), c);
+    case "catph": {
+      const row = await first(env, "SELECT name FROM categories WHERE id = ?", Number(b));
+      if (!row) return warn(env, cb, "Раздел не найден");
+      await setState(env, uid, "catphoto", { cid: Number(b) });
+      await send(env, chat,
+        `Отправьте фото для раздела «${esc(row.name)}» (или «-», чтобы убрать).\n` +
+        "Оно показывается у товаров этого раздела, у которых нет своего фото.\n/cancel — отмена");
+      return;
+    }
     case "stk": {
       const pid = Number(b);
       if (!(await getProduct(env, pid))) return warn(env, cb, "Товар не найден");
       await run(env, "UPDATE products SET stock = MAX(0, stock + ?) WHERE id = ?", Number(c), pid);
-      await refreshCard(env, msg, await getProduct(env, pid), Number(d) || 0, true, uid);
+      await refreshCard(env, msg, await getProduct(env, pid), Number.isFinite(Number(d)) ? Number(d) : -1, true, uid);
       return;
     }
     case "del": {
       const p = await getProduct(env, Number(b));
       if (!p) return warn(env, cb, "Товар не найден");
       await show(env, msg, `Удалить «${esc(p.name)}»? Это необратимо.`,
-        kb([[btn("🗑 Да, удалить", `delok:${p.id}`), btn("Отмена", `item:${p.id}:0`)]]));
+        kb([[btn("🗑 Да, удалить", `delok:${p.id}`), btn("Отмена", `item:${p.id}:-1`)]]));
       return;
     }
     case "delok": {
