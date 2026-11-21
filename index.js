@@ -305,6 +305,16 @@ async function bonusScreen(env, uid) {
 const SUPPORT_GAP_MS = 5000; // защита от потока сообщений от одного клиента
 const SUPPORT_MAX_TEXT = 1500;
 
+/** Писать магазину можно только после первой брони (любой, даже отменённой). */
+const hasOrders = async (env, uid) =>
+  !!(await first(env, "SELECT 1 AS x FROM orders WHERE user_id = ? LIMIT 1", uid));
+
+/** Кнопки под списком «Мои брони»: «Связаться с магазином» только если есть брони. */
+const ordersMarkup = async (env, uid) =>
+  kb((await hasOrders(env, uid))
+    ? [[btn("📚 В каталог", "catalog")], [btn("✉️ Связаться с магазином", "sup:start")]]
+    : [[btn("📚 В каталог", "catalog")]]);
+
 const supportMarkup = () =>
   kb([[btn("✉️ Написать ещё", "sup:start")], [btn("🏠 Меню", "menu")]]);
 
@@ -606,7 +616,7 @@ async function mainMenu(env, uid) {
     [btn(n ? `🛒 Забронировать (${n})` : "🛒 Забронировать", "cart:view")],
     [btn("📋 Мои брони", "my"), btn(`🎁 Бонусы: ${await bonusBalance(env, uid)}`, "bonus")],
   ];
-  rows.push([btn("✉️ Связаться с магазином", "sup:start")]);
+  if (await hasOrders(env, uid)) rows.push([btn("✉️ Связаться с магазином", "sup:start")]);
   if (manager(env)) rows.push([urlBtn("💬 Менеджер", `https://t.me/${manager(env)}`)]);
   if (await asAdmin(env, uid)) rows.push([btn("⚙️ Админ-панель", "adm:panel")]);
   else if (isAdmin(env, uid)) rows.push([btn("⚙️ Вернуться в админ-режим", "adm:on")]);
@@ -836,7 +846,7 @@ async function onCommand(env, m, cmd) {
       return send(env, chat, "Отменено.");
     case "/orders":
       if (!(await isConfirmed(env, uid))) return askAge(env, chat);
-      return send(env, chat, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "catalog")], [btn("✉️ Связаться с магазином", "sup:start")]]));
+      return send(env, chat, await myOrdersText(env, uid), await ordersMarkup(env, uid));
     case "/active": {
       if (!admin) return;
       const s = await activeOrdersScreen(env);
@@ -1076,6 +1086,9 @@ async function route(env, cb) {
     case "cart":
       return cartAction(env, cb, b, Number(c));
     case "sup":
+      if (!(await hasOrders(env, uid))) {
+        return warn(env, cb, "Написать магазину можно после первой брони. Выберите товар и забронируйте его.");
+      }
       await setState(env, uid, "support", {});
       await send(env, msg.chat.id,
         "✉️ <b>Сообщение магазину</b>\n\nНапишите одним сообщением, что хотите узнать. Можно приложить фото. " +
@@ -1095,7 +1108,7 @@ async function route(env, cb) {
       return;
     }
     case "my":
-      await show(env, msg, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "catalog")], [btn("✉️ Связаться с магазином", "sup:start")]]));
+      await show(env, msg, await myOrdersText(env, uid), await ordersMarkup(env, uid));
       return;
   }
 }
