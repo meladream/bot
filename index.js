@@ -109,13 +109,26 @@ async function initDb(env) {
       "PRIMARY KEY(user_id, product_id))"),
     q("CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, " +
       "username TEXT NOT NULL DEFAULT '', first_name TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', " +
-      "status TEXT NOT NULL DEFAULT 'new', total REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (datetime('now')))"),
+      "status TEXT NOT NULL DEFAULT 'new', total REAL NOT NULL DEFAULT 0, bonus_spent INTEGER NOT NULL DEFAULT 0, " +
+      "bonus_earned INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (datetime('now')))"),
+    q("CREATE TABLE IF NOT EXISTS bonus_log(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, " +
+      "delta INTEGER NOT NULL, reason TEXT NOT NULL, order_id INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now')))"),
+    q("CREATE INDEX IF NOT EXISTS idx_bonus_user ON bonus_log(user_id)"),
+    q("CREATE TABLE IF NOT EXISTS relay(admin_chat INTEGER NOT NULL, msg_id INTEGER NOT NULL, client_id INTEGER NOT NULL, " +
+      "created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(admin_chat, msg_id))"),
     q("CREATE TABLE IF NOT EXISTS order_items(id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, " +
       "product_id INTEGER, name TEXT NOT NULL, price REAL NOT NULL, qty INTEGER NOT NULL)"),
   ]);
   // база, созданная старой версией, не имеет колонки photo у разделов
   try { await env.DB.prepare("ALTER TABLE categories ADD COLUMN photo TEXT NOT NULL DEFAULT ''").run(); }
   catch { /* колонка уже есть */ }
+  // бонусные колонки у броней из прошлых версий
+  for (const alter of [
+    "ALTER TABLE orders ADD COLUMN bonus_spent INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE orders ADD COLUMN bonus_earned INTEGER NOT NULL DEFAULT 0",
+  ]) {
+    try { await env.DB.prepare(alter).run(); } catch { /* колонка уже есть */ }
+  }
   dbReady = true;
 }
 
@@ -206,9 +219,11 @@ async function cartView(env, uid) {
   const total = rows.reduce((s, r) => s + r.price * r.qty, 0);
   const lines = rows.map((r, i) =>
     `${i + 1}. ${esc(r.name)} × ${r.qty} — ${fmtPrice(r.price * r.qty)} ${cur(env)}`);
+  const earn = Math.floor((total * bonusPercent(env)) / 100);
   const text =
     "🧺 <b>Ваша корзина</b>\n\n" + lines.join("\n") +
     `\n\n<b>Итого: ${fmtPrice(total)} ${cur(env)}</b>` + note +
+    (earn > 0 ? `\n🎁 За эту бронь начислим бонусов: ~${earn}` : "") +
     "\n\nБронь на самовывоз, оплата при получении.";
   const mk = rows.map((r) => [
     btn("➖", `cart:dec:${r.product_id}`),
@@ -218,6 +233,148 @@ async function cartView(env, uid) {
   mk.push([btn("🗑 Очистить", "cart:clear"), btn("✅ Забронировать", "cart:go")]);
   mk.push([btn("📚 В каталог", "catalog")]);
   return { text, markup: kb(mk) };
+}
+
+// ------------------------------------------------------------------ бонусы
+
+const bonusPercent = (env) => {
+  const v = Number(env.BONUS_PERCENT ?? 5);
+  return Number.isFinite(v) && v >= 0 && v <= 100 ? v : 5;
+};
+const bonusMaxPercent = (env) => {
+  const v = Number(env.BONUS_MAX_PERCENT ?? 30);
+  return Number.isFinite(v) && v >= 0 && v <= 100 ? v : 30;
+};
+
+const bonusBalance = async (env, uid) =>
+  (await first(env, "SELECT COALESCE(SUM(delta), 0) AS b FROM bonus_log WHERE user_id = ?", uid)).b;
+
+/** Сколько бонусов можно списать в этой брони. */
+const maxSpend = (env, balance, total) =>
+  Math.max(0, Math.min(balance, Math.floor((total * bonusMaxPercent(env)) / 100)));
+
+const bonusAdd = (env, uid, delta, reason, orderId = null) =>
+  run(env, "INSERT INTO bonus_log(user_id, delta, reason, order_id) VALUES (?, ?, ?, ?)",
+    uid, delta, reason, orderId);
+
+/** Списание одним запросом: проходит, только если на карте хватает бонусов (защита от двойной траты). */
+async function bonusSpend(env, uid, amount, reason, orderId = null) {
+  const r = await run(env,
+    "INSERT INTO bonus_log(user_id, delta, reason, order_id) SELECT ?, ?, ?, ? " +
+    "WHERE (SELECT COALESCE(SUM(delta), 0) FROM bonus_log WHERE user_id = ?) >= ?",
+    uid, -amount, reason, orderId, uid, amount);
+  return r.meta.changes === 1;
+}
+
+const BONUS_REASONS = {
+  earn: "начислено за бронь",
+  spend: "списано в брони",
+  refund: "возврат по брони",
+  manual: "корректировка магазина",
+};
+
+async function bonusScreen(env, uid) {
+  const bal = await bonusBalance(env, uid);
+  const st = await first(env,
+    "SELECT COUNT(*) AS n, COALESCE(SUM(total - bonus_spent), 0) AS s FROM orders WHERE user_id = ? AND status = 'done'", uid);
+  const log = await all(env,
+    "SELECT delta, reason, order_id FROM bonus_log WHERE user_id = ? ORDER BY id DESC LIMIT 5", uid);
+  const pct = bonusPercent(env);
+  const lines = [
+    `💳 <b>Бонусная карта</b> № ${String(uid).slice(-6).padStart(6, "0")}`,
+    "",
+    `🎁 Баланс: <b>${bal}</b> бонусов`,
+    `🛍 Выдано броней: ${st.n} на ${fmtPrice(st.s)} ${esc(cur(env))}`,
+    "",
+  ];
+  if (pct > 0) lines.push(`✨ Возвращаем ${pct}% бонусами с каждой выданной брони.`);
+  lines.push(`💳 1 бонус = 1 ${esc(cur(env))}. Бонусами можно оплатить до ${bonusMaxPercent(env)}% стоимости брони.`);
+  if (log.length) {
+    lines.push("", "<b>Последние операции</b>");
+    for (const r of log) {
+      const sign = r.delta > 0 ? `+${r.delta}` : `−${-r.delta}`;
+      const ref = r.order_id ? ` №${r.order_id}` : "";
+      lines.push(`${sign} · ${BONUS_REASONS[r.reason] || r.reason}${ref}`);
+    }
+  }
+  return { text: lines.join("\n"), markup: kb([[btn("🛍 В каталог", "catalog")], [btn("🏠 Меню", "menu")]]) };
+}
+
+// ------------------------------------------------------------------ чат клиент ↔ магазин
+
+const SUPPORT_GAP_MS = 5000; // защита от потока сообщений от одного клиента
+const SUPPORT_MAX_TEXT = 1500;
+
+const supportMarkup = () =>
+  kb([[btn("✉️ Написать ещё", "sup:start")], [btn("🏠 Меню", "menu")]]);
+
+/** Сообщение клиента → всем админам. Возвращает, скольким доставлено. */
+async function forwardToAdmins(env, m) {
+  const u = m.from;
+  const lastOrder = await first(env, "SELECT id, status FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1", u.id);
+  const who = `<a href="tg://user?id=${u.id}">${esc(u.first_name || "клиент")}</a>` +
+    (u.username ? ` (@${esc(u.username)})` : "") + ` · ID ${u.id}`;
+  const orderLine = lastOrder ? `\n🧾 Последняя бронь №${lastOrder.id}: ${STATUS[lastOrder.status] || lastOrder.status}` : "";
+  const head = `💬 <b>Сообщение от клиента</b>\n${who}${orderLine}`;
+  const markup = kb([[btn("↩️ Ответить", `rep:${u.id}`)]]);
+
+  await run(env, "DELETE FROM relay WHERE created_at < datetime('now', '-30 days')");
+  let delivered = 0;
+  for (const aid of adminIds(env)) {
+    try {
+      const ids = [];
+      if (m.text) {
+        const body = m.text.length > SUPPORT_MAX_TEXT ? m.text.slice(0, SUPPORT_MAX_TEXT) + "…" : m.text;
+        const r = await send(env, aid, `${head}\n\n${esc(body)}`, markup);
+        if (r.ok && r.result?.message_id) ids.push(r.result.message_id);
+      } else {
+        const h = await send(env, aid, head);
+        if (h.ok && h.result?.message_id) ids.push(h.result.message_id);
+        const c = await tg(env, "copyMessage", {
+          chat_id: aid, from_chat_id: m.chat.id, message_id: m.message_id, reply_markup: markup,
+        });
+        if (c.ok && c.result?.message_id) ids.push(c.result.message_id);
+        else if (c.ok) ids.push(0);
+      }
+      for (const id of ids.filter(Boolean)) {
+        await run(env, "INSERT OR REPLACE INTO relay(admin_chat, msg_id, client_id) VALUES (?, ?, ?)", aid, id, u.id);
+      }
+      if (ids.length) delivered++;
+    } catch (e) {
+      console.log("Не удалось переслать админу", aid, e);
+    }
+  }
+  return delivered;
+}
+
+/** Ответ админа → клиенту. Остальным админам тоже показываем, кто и что ответил. */
+async function replyToClient(env, clientId, m) {
+  const markup = kb([[btn("✉️ Ответить магазину", "sup:start")], [btn("🏠 Меню", "menu")]]);
+  let r;
+  if (m.text) {
+    const body = m.text.length > 3500 ? m.text.slice(0, 3500) + "…" : m.text;
+    r = await send(env, clientId, `💬 <b>Магазин:</b>\n${esc(body)}`, markup);
+  } else {
+    await send(env, clientId, "💬 <b>Магазин:</b>");
+    r = await tg(env, "copyMessage", {
+      chat_id: clientId, from_chat_id: m.chat.id, message_id: m.message_id, reply_markup: markup,
+    });
+  }
+  if (!r.ok) return false;
+  const note = `↪️ ${esc(m.from.first_name || "Админ")} ответил клиенту ${clientId}:\n` +
+    (m.text ? esc(m.text.length > 500 ? m.text.slice(0, 500) + "…" : m.text) : "(вложение)");
+  for (const aid of adminIds(env)) {
+    if (aid !== m.from.id) {
+      try { await send(env, aid, note); } catch { /* админ мог не открывать бота */ }
+    }
+  }
+  return true;
+}
+
+async function adminReplyResult(env, chat, ok) {
+  return send(env, chat, ok
+    ? "✅ Отправлено клиенту."
+    : "⚠️ Не доставлено: клиент мог заблокировать бота.");
 }
 
 // ------------------------------------------------------------------ брони
@@ -248,6 +405,11 @@ async function orderText(env, o, admin) {
   const parts = [`🧾 <b>Бронь №${o.id}</b> · ${STATUS[o.status] || o.status}`, ""];
   if (admin) parts.push(`👤 ${userLink(o)}`, `📞 ${esc(o.contact)}`, "");
   parts.push(...lines, "", `<b>Итого: ${fmtPrice(o.total)} ${cur(env)}</b>`);
+  if (o.bonus_spent > 0) {
+    parts.push(`🎁 Оплачено бонусами: −${o.bonus_spent} ${cur(env)}`,
+      `<b>К оплате: ${fmtPrice(o.total - o.bonus_spent)} ${cur(env)}</b>`);
+  }
+  if (o.bonus_earned > 0) parts.push(`✨ Начислено бонусов: +${o.bonus_earned}`);
   if (!admin) parts.push("", "Самовывоз, оплата при получении.");
   return parts.join("\n");
 }
@@ -259,6 +421,7 @@ function orderButtons(o) {
   } else if (o.status === "confirmed") {
     rows.push([btn("📦 Выдан", `ord:${o.id}:done`), btn("❌ Отменить", `ord:${o.id}:cancel`)]);
   }
+  rows.push([btn("✉️ Написать клиенту", `rep:${o.user_id}`)]);
   rows.push([btn("📋 Все брони", "adm:orders")]);
   return kb(rows);
 }
@@ -272,12 +435,14 @@ async function myOrdersText(env, uid) {
     ...ids);
   const blocks = orders.map((o) => {
     const list = items.filter((i) => i.order_id === o.id).map((i) => `${esc(i.name)} ×${i.qty}`).join(", ");
-    return `<b>№${o.id}</b> · ${fmtPrice(o.total)} ${cur(env)} · ${STATUS_USER[o.status] || o.status}\n${list}`;
+    return `<b>№${o.id}</b> · ${fmtPrice(o.total)} ${cur(env)} · ${STATUS_USER[o.status] || o.status}` +
+      (o.bonus_spent > 0 ? ` · 🎁 −${o.bonus_spent}` : "") +
+      (o.bonus_earned > 0 ? ` · ✨ +${o.bonus_earned}` : "") + `\n${list}`;
   });
   return "📋 <b>Мои брони</b>\n\n" + blocks.join("\n\n");
 }
 
-async function placeOrder(env, m, contact) {
+async function placeOrder(env, m, contact, wantSpend = 0) {
   const uid = m.from.id;
   const chat = m.chat.id;
   await clearState(env, uid);
@@ -306,6 +471,8 @@ async function placeOrder(env, m, contact) {
   }
 
   const total = rows.reduce((s, r) => s + r.price * r.qty, 0);
+  const spend = wantSpend > 0
+    ? Math.min(wantSpend, maxSpend(env, await bonusBalance(env, uid), total)) : 0;
   const res = await run(env,
     "INSERT INTO orders(user_id, username, first_name, contact, status, total) VALUES (?, ?, ?, ?, 'new', ?)",
     uid, m.from.username || "", m.from.first_name || "", contact, total);
@@ -315,11 +482,20 @@ async function placeOrder(env, m, contact) {
       .bind(oid, r.product_id, r.name, r.price, r.qty)));
   await run(env, "DELETE FROM cart WHERE user_id = ?", uid);
 
+  let spendNote = "";
+  if (spend > 0) {
+    if (await bonusSpend(env, uid, spend, "spend", oid)) {
+      await run(env, "UPDATE orders SET bonus_spent = ? WHERE id = ?", spend, oid);
+    } else {
+      spendNote = "\n\n⚠️ Бонусы списать не получилось (на карте не хватило), оплата полной суммой.";
+    }
+  }
+
   const o = await first(env, "SELECT * FROM orders WHERE id = ?", oid);
   await send(env, chat,
-    `✅ <b>Бронь №${oid} принята!</b>\n\n` + (await orderText(env, o, false)) +
+    `✅ <b>Бронь №${oid} принята!</b>\n\n` + (await orderText(env, o, false)) + spendNote +
     "\n\nМенеджер скоро свяжется с вами. Статус смотрите в «📋 Мои брони».",
-    kb([[btn("📋 Мои брони", "my")], [btn("📚 В каталог", "catalog")]]));
+    kb([[btn("📋 Мои брони", "my")], [btn("✉️ Связаться с магазином", "sup:start")], [btn("📚 В каталог", "catalog")]]));
 
   const adminText = "🔔 <b>Новая бронь!</b>\n\n" + (await orderText(env, o, true));
   for (const id of adminIds(env)) {
@@ -348,12 +524,13 @@ async function orderCallback(env, cb, id, act) {
   const res = await run(env,
     `UPDATE orders SET status = ? WHERE id = ? AND status IN (${rule.from.map(() => "?").join(",")})`,
     rule.to, id, ...rule.from);
-  const fresh = await first(env, "SELECT * FROM orders WHERE id = ?", id);
+  let fresh = await first(env, "SELECT * FROM orders WHERE id = ?", id);
   if (res.meta.changes !== 1) {
     await show(env, msg, await orderText(env, fresh, true), orderButtons(fresh));
     return warn(env, cb, "Статус уже изменён");
   }
 
+  let extra = "";
   if (rule.to === "cancelled") {
     const items = await all(env, "SELECT product_id, qty FROM order_items WHERE order_id = ?", id);
     for (const it of items) {
@@ -361,15 +538,28 @@ async function orderCallback(env, cb, id, act) {
         await run(env, "UPDATE products SET stock = stock + ? WHERE id = ?", it.qty, it.product_id);
       }
     }
+    if (o.bonus_spent > 0) {
+      await bonusAdd(env, o.user_id, o.bonus_spent, "refund", id);
+      extra = `\n🎁 Списанные бонусы (${o.bonus_spent}) вернулись на карту.`;
+    }
   }
+  if (rule.to === "done") {
+    const earned = Math.floor(((o.total - o.bonus_spent) * bonusPercent(env)) / 100);
+    if (earned > 0) {
+      await bonusAdd(env, o.user_id, earned, "earn", id);
+      await run(env, "UPDATE orders SET bonus_earned = ? WHERE id = ?", earned, id);
+      extra = `\n✨ Начислено бонусов: +${earned}. Баланс: ${await bonusBalance(env, o.user_id)}.`;
+    }
+  }
+  fresh = await first(env, "SELECT * FROM orders WHERE id = ?", id);
   await show(env, msg, await orderText(env, fresh, true), orderButtons(fresh));
 
   const notice = {
     confirmed: `✅ Бронь №${id} подтверждена. Товар ждёт вас, приходите за ним.`,
     done: `📦 Бронь №${id} выдана. Спасибо за покупку!`,
     cancelled: `❌ Бронь №${id} отменена. Если это ошибка, свяжитесь с менеджером.`,
-  }[rule.to];
-  await send(env, o.user_id, notice, kb([[btn("📋 Мои брони", "my")]]));
+  }[rule.to] + extra;
+  await send(env, o.user_id, notice, kb([[btn("📋 Мои брони", "my")], [btn("✉️ Связаться с магазином", "sup:start")]]));
 }
 
 // ------------------------------------------------------------------ внешний вид
@@ -381,8 +571,11 @@ const ADMIN_TEXT =
   "управления (остаток, цена, описание, фото товара и раздела, удаление).\n\n" +
   "Новые брони приходят сюда сообщением с кнопками статуса. " +
   "Чтобы они приходили, один раз нажмите /start у бота.\n\n" +
+  "💬 Сообщения клиентов тоже приходят сюда. Ответьте на них функцией Telegram «Ответить» " +
+  "(или кнопкой «↩️ Ответить»), и текст уйдёт клиенту.\n\n" +
   "/active — активные брони\n/banner — главная картинка магазина (меню и каталог)\n" +
   "/user — посмотреть бота глазами покупателя (вернуться: /admin)\n" +
+  "/bonus ID — баланс клиента, /bonus ID +100 или -50 — начислить или списать\n" +
   "/stats — статистика\n/export — выгрузить товары файлом\n/cancel — отменить ввод";
 
 const adminPanel = () =>
@@ -411,9 +604,10 @@ async function mainMenu(env, uid) {
   const rows = [
     [btn("🛍 Каталог", "catalog")],
     [btn(n ? `🛒 Забронировать (${n})` : "🛒 Забронировать", "cart:view")],
-    [btn("📋 Мои брони", "my")],
+    [btn("📋 Мои брони", "my"), btn(`🎁 Бонусы: ${await bonusBalance(env, uid)}`, "bonus")],
   ];
-  if (manager(env)) rows[2].push(urlBtn("💬 Менеджер", `https://t.me/${manager(env)}`));
+  rows.push([btn("✉️ Связаться с магазином", "sup:start")]);
+  if (manager(env)) rows.push([urlBtn("💬 Менеджер", `https://t.me/${manager(env)}`)]);
   if (await asAdmin(env, uid)) rows.push([btn("⚙️ Админ-панель", "adm:panel")]);
   else if (isAdmin(env, uid)) rows.push([btn("⚙️ Вернуться в админ-режим", "adm:on")]);
   return kb(rows);
@@ -561,6 +755,16 @@ async function onMessage(env, m) {
 
   if (text.startsWith("/")) return onCommand(env, m, text.split(/[\s@]/)[0].toLowerCase());
 
+  // админ отвечает на сообщение клиента обычным «Ответить» в Telegram
+  if (m.reply_to_message && isAdmin(env, uid)) {
+    const rel = await first(env, "SELECT client_id FROM relay WHERE admin_chat = ? AND msg_id = ?",
+      chat, m.reply_to_message.message_id);
+    if (rel) {
+      await clearState(env, uid);
+      return adminReplyResult(env, chat, await replyToClient(env, rel.client_id, m));
+    }
+  }
+
   const st = await getState(env, uid);
   if (st) return onState(env, m, st);
 
@@ -600,6 +804,31 @@ async function onCommand(env, m, cmd) {
       await clearState(env, uid);
       if (!(await isConfirmed(env, uid))) return askAge(env, chat);
       return sendMenu(env, chat, uid);
+    case "/bonus": {
+      const parts = (m.text || "").trim().split(/\s+/);
+      if (admin && parts.length >= 2) {
+        const target = Number(parts[1]);
+        if (!Number.isInteger(target) || target <= 0) {
+          return send(env, chat, "Формат: /bonus ID_клиента — баланс\n/bonus ID_клиента +100 — начислить\n/bonus ID_клиента -50 — списать");
+        }
+        if (parts.length >= 3) {
+          const n = Number(parts[2].replace(",", "."));
+          if (!Number.isInteger(n) || n === 0) return send(env, chat, "Сумма — целое число, например +100 или -50.");
+          if (n > 0) await bonusAdd(env, target, n, "manual");
+          else if (!(await bonusSpend(env, target, -n, "manual"))) {
+            return send(env, chat, `У клиента ${target} меньше ${-n} бонусов, списать нельзя.`);
+          }
+          try {
+            await send(env, target, `🎁 Магазин ${n > 0 ? "начислил вам" : "списал с вашей карты"} ${Math.abs(n)} бонусов. ` +
+              `Баланс: ${await bonusBalance(env, target)}.`);
+          } catch { /* клиент мог не открывать бота */ }
+        }
+        return send(env, chat, `🎁 Клиент ${target}: ${await bonusBalance(env, target)} бонусов.`);
+      }
+      if (!admin && !(await isConfirmed(env, uid))) return askAge(env, chat);
+      const s = await bonusScreen(env, uid);
+      return send(env, chat, s.text, s.markup);
+    }
     case "/id":
       return send(env, chat, `Ваш Telegram ID: <code>${uid}</code>`);
     case "/cancel":
@@ -607,7 +836,7 @@ async function onCommand(env, m, cmd) {
       return send(env, chat, "Отменено.");
     case "/orders":
       if (!(await isConfirmed(env, uid))) return askAge(env, chat);
-      return send(env, chat, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "catalog")]]));
+      return send(env, chat, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "catalog")], [btn("✉️ Связаться с магазином", "sup:start")]]));
     case "/active": {
       if (!admin) return;
       const s = await activeOrdersScreen(env);
@@ -675,7 +904,23 @@ async function onState(env, m, st) {
     if (text.length < 5) {
       return send(env, chat, "Напишите имя и телефон одним сообщением, например:\nИван, +7 900 000-00-00");
     }
-    return placeOrder(env, m, text.slice(0, 200));
+    return placeOrder(env, m, text.slice(0, 200), Number(d.spend) || 0);
+  }
+
+  // диалог покупателя: сообщение магазину
+  if (st.state === "support") {
+    const last = Number(await getSetting(env, `sup:${uid}`)) || 0;
+    if (Date.now() - last < SUPPORT_GAP_MS) {
+      return send(env, chat, "⏳ Слишком часто. Подождите несколько секунд и отправьте сообщение ещё раз.");
+    }
+    await setSetting(env, `sup:${uid}`, String(Date.now()));
+    const n = await forwardToAdmins(env, m);
+    await clearState(env, uid);
+    if (!n) {
+      return send(env, chat, "😔 Не получилось доставить сообщение. Попробуйте позже.",
+        kb([[btn("🏠 Меню", "menu")]]));
+    }
+    return send(env, chat, "✅ Сообщение отправлено магазину. Ответ придёт сюда, в этот чат.", supportMarkup());
   }
 
   // остальные диалоги только для админов
@@ -685,6 +930,11 @@ async function onState(env, m, st) {
   }
 
   switch (st.state) {
+    case "reply": {
+      const ok = await replyToClient(env, d.client, m);
+      await clearState(env, uid);
+      return adminReplyResult(env, chat, ok);
+    }
     case "banner": {
       if (m.photo) await setSetting(env, "banner", m.photo[m.photo.length - 1].file_id);
       else if (text === "-") await delSetting(env, "banner");
@@ -775,7 +1025,7 @@ async function onState(env, m, st) {
 
 // ------------------------------------------------------------------ кнопки
 
-const ADMIN_ACTIONS = ["adm", "stk", "del", "delok", "ed", "addcat", "ord", "catph"];
+const ADMIN_ACTIONS = ["adm", "stk", "del", "delok", "ed", "addcat", "ord", "catph", "rep"];
 
 async function onCallback(env, cb) {
   const answered = await route(env, cb);
@@ -825,8 +1075,27 @@ async function route(env, cb) {
       return addToCart(env, cb, Number(b), Number(c));
     case "cart":
       return cartAction(env, cb, b, Number(c));
+    case "sup":
+      await setState(env, uid, "support", {});
+      await send(env, msg.chat.id,
+        "✉️ <b>Сообщение магазину</b>\n\nНапишите одним сообщением, что хотите узнать. Можно приложить фото. " +
+        "Ответ придёт сюда, в этот чат.\n\n/cancel — отмена");
+      return;
+    case "bonus": {
+      const s = await bonusScreen(env, uid);
+      await show(env, msg, s.text, s.markup);
+      return;
+    }
+    case "bon": {
+      const rows = await cartRows(env, uid);
+      if (!rows.length) return toast(env, cb, "Корзина пуста");
+      const total = rows.reduce((s, r) => s + r.price * r.qty, 0);
+      const spend = b === "use" ? maxSpend(env, await bonusBalance(env, uid), total) : 0;
+      await askContact(env, msg.chat.id, uid, spend, total, msg);
+      return;
+    }
     case "my":
-      await show(env, msg, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "catalog")]]));
+      await show(env, msg, await myOrdersText(env, uid), kb([[btn("📚 В каталог", "catalog")], [btn("✉️ Связаться с магазином", "sup:start")]]));
       return;
   }
 }
@@ -869,6 +1138,19 @@ async function addToCart(env, cb, pid, i) {
   return toast(env, cb, `Добавлено в корзину ✅ (${qty + 1} шт.)`);
 }
 
+/** Запросить имя и телефон для брони (spend — сколько бонусов спишем). */
+async function askContact(env, chat, uid, spend, total, msg = null) {
+  await setState(env, uid, "order_contact", { spend });
+  const pay = spend > 0
+    ? `\n\n🎁 Бонусами оплатим <b>${spend} ${esc(cur(env))}</b>, к оплате <b>${fmtPrice(total - spend)} ${esc(cur(env))}</b>.`
+    : "";
+  const text =
+    "📝 <b>Оформление брони</b>" + pay +
+    "\n\nНапишите одним сообщением, как к вам обращаться и ваш телефон, например:\n" +
+    "<i>Иван, +7 900 000-00-00</i>\n\n/cancel — отмена";
+  return msg ? edit(env, msg, text) : send(env, chat, text);
+}
+
 async function cartAction(env, cb, act, pid) {
   const uid = cb.from.id;
   const msg = cb.message;
@@ -887,10 +1169,17 @@ async function cartAction(env, cb, act, pid) {
   } else if (act === "go") {
     const rows = await cartRows(env, uid);
     if (!rows.length) return toast(env, cb, "Корзина пуста");
-    await setState(env, uid, "order_contact", {});
-    await send(env, msg.chat.id,
-      "📝 <b>Оформление брони</b>\n\nНапишите одним сообщением, как к вам обращаться и ваш телефон, например:\n" +
-      "<i>Иван, +7 900 000-00-00</i>\n\n/cancel — отмена");
+    const total = rows.reduce((s, r) => s + r.price * r.qty, 0);
+    const bal = await bonusBalance(env, uid);
+    const ms = maxSpend(env, bal, total);
+    if (ms > 0) {
+      await send(env, msg.chat.id,
+        `🎁 <b>Бонусы</b>\n\nНа вашей карте <b>${bal}</b> бонусов. Ими можно оплатить до ` +
+        `<b>${ms} ${esc(cur(env))}</b> из ${fmtPrice(total)} ${esc(cur(env))} (не больше ${bonusMaxPercent(env)}% брони).\n\nСписать?`,
+        kb([[btn(`💳 Списать ${ms}`, "bon:use"), btn("Не списывать", "bon:no")]]));
+      return;
+    }
+    await askContact(env, msg.chat.id, uid, 0, total);
     return;
   }
 
@@ -933,6 +1222,14 @@ async function adminCallback(env, cb, a, b, c, d) {
     }
     case "ord":
       return orderCallback(env, cb, Number(b), c);
+    case "rep": {
+      const cid = Number(b);
+      if (!Number.isInteger(cid) || cid <= 0) return warn(env, cb, "Клиент не найден");
+      await setState(env, uid, "reply", { client: cid });
+      await send(env, chat,
+        `✍️ Пишите ответ клиенту (ID ${cid}). Ваше следующее сообщение уйдёт ему, можно с фото.\n/cancel — отмена`);
+      return;
+    }
     case "catph": {
       const row = await first(env, "SELECT name FROM categories WHERE id = ?", Number(b));
       if (!row) return warn(env, cb, "Раздел не найден");
