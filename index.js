@@ -934,7 +934,7 @@ async function sectionView(env, id, uid, tree = null) {
   const admin = await asAdmin(env, uid);
   const kids = admin ? n.children : n.children.filter((c) => c.total > 0);
   const rows = kids.map((c) => [btn(`${c.name} (${c.total})`, `sec:${c.id}`)]);
-  if (n.own > 0) rows.push([btn(`📦 Товары раздела (${n.own})`, `pg:${id}:0`)]);
+  if (n.own > 0) rows.push([btn(`📦 Товары (${n.own})`, `pg:${id}:0`)]);
   if (admin) {
     const add = [btn("➕ Товар сюда", `addcat:${id}`)];
     if (depthOf(tree, id) < MAX_DEPTH) add.unshift(btn("➕ Подраздел", `subnew:${id}`));
@@ -1019,11 +1019,12 @@ async function cardView(env, p, admin, uid, i) {
     rows.push([btn("📦 Остаток", `ed:stock:${p.id}`), btn("📝 Описание", `ed:desc:${p.id}`)]);
     rows.push([btn("🖼 Фото товара", `ed:photo:${p.id}`), btn("🗑 Удалить", `del:${p.id}`)]);
     rows.push([btn("📂 Переместить", `mv:${p.id}`), btn("🖼 Фото раздела", `catph:${p.category_id}`)]);
+    rows.push([btn("⚙️ Управление разделом", `sec:${p.category_id}:m`)]);
   }
   // назад: админу на экран раздела; покупателю на экран раздела, если там есть подразделы, иначе уровнем выше
   const node = tree.nodes.get(p.category_id);
   let back = "catalog";
-  if (admin || (node && node.children.some((c) => c.total > 0))) back = `sec:${p.category_id}`;
+  if (node && node.children.some((c) => admin || c.total > 0)) back = `sec:${p.category_id}`;
   else if (node && node.parent_id && tree.nodes.has(node.parent_id)) back = `sec:${node.parent_id}`;
   rows.push([btn("⬅️ Назад", back), btn("📚 Каталог", "catalog"), btn("🏠 Меню", "menu")]);
   // у товара нет своего фото — показываем фото его раздела (или ближайшего родителя)
@@ -1485,7 +1486,7 @@ async function route(env, cb) {
       await showCatalog(env, msg, uid);
       return;
     case "sec":
-      return showSection(env, cb, Number(b));
+      return showSection(env, cb, Number(b), c === "m");
     case "promo": {
       if (b === "drop") {
         const pend = await first(env, "SELECT code FROM user_promo WHERE user_id = ?", uid);
@@ -1540,7 +1541,7 @@ async function route(env, cb) {
 }
 
 /** Открыть раздел: покупателю сразу товары, если подразделов нет; админу всегда экран раздела. */
-async function showSection(env, cb, id) {
+async function showSection(env, cb, id, manage = false) {
   const uid = cb.from.id;
   const tree = await loadTree(env);
   const n = tree.nodes.get(id);
@@ -1550,7 +1551,8 @@ async function showSection(env, cb, id) {
     await showCatalog(env, cb.message, uid);
     return true;
   }
-  if (!admin && !n.children.some((c) => c.total > 0)) return showPager(env, cb, id, 0);
+  const hasKids = (admin ? n.children.length : n.children.filter((c) => c.total > 0).length) > 0;
+  if (!manage && n.own > 0 && !hasKids) return showPager(env, cb, id, 0);
   const v = await sectionView(env, id, uid, tree);
   await screen(env, cb.message, v.text, v.markup, v.photo);
 }
